@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional
 
+from torch.distributed import all_gather
+
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -134,6 +136,116 @@ class SchedulerPPMixin:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
+
+    def _handle_bootstrap(self, pp_group):
+        if pp_group.is_first_rank:
+            boot_reqs, failed_reqs = (
+                self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
+                    return_failed_reqs=True
+                )
+            )
+
+            boot_rids = [r.rid for r in boot_reqs]
+            if failed_reqs:
+                boot_rids.extend(r.rid for r in failed_reqs)
+            return boot_reqs, boot_rids
+
+        boot_rids = self.recv_pyobj_from_prev_stage()
+        boot_reqs = (
+            self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
+                rids_to_check=boot_rids
+            )
+        )
+        return boot_reqs, boot_rids
+
+
+    def _handle_transferred_rids(self, pp_group):
+        curr = self.get_transferred_rids()
+        if pp_group.is_first_rank:
+            return curr
+
+        prev = self.recv_pyobj_from_prev_stage()
+        return list(set(prev) & set(curr))
+
+
+    def _send_last_rank_outputs(self, pp_group, release_rids, result):
+        if not self.cur_batch:
+            return None
+
+        pp_outputs = PPProxyTensors(
+            {
+                "next_token_ids": result.next_token_ids
+            }
+        )
+        pp_group.send_tensor_dict(
+            pp_outputs.tensors,
+            all_gather_group=self.attn_tp_group
+        )
+
+        if release_rids:
+            self.send_pyobj_to_next_stage(release_rids)
+
+        return pp_outputs
+
+
+    def _send_non_last_rank_outputs(self,
+                                    pp_group,
+                                    pp_outputs,
+                                    recv_reqs,
+                                    boot_rids,
+                                    tmb,
+                                    release_rids=None
+                                    ):
+        if pp_outputs:
+            pp_group.send_tensor_dict(
+                pp_outputs.tensors,
+                all_gather_group=self.attn_tp_group
+            )
+        if release_rids:
+            self.send_pyobj_to_next_stage(release_rids)
+
+        self.send_pyobj_to_next_stage(recv_reqs)
+        self.send_pyobj_to_next_stage(boot_rids)
+        self.send_pyobj_to_next_stage(tmb)
+
+        if self.cur_batch:
+            assert self.running_batch.result.pp_hidden_states_proxy_tensors.tensors is not None
+            pp_group.send_tensor_dict(
+                self.running_batch.result.pp_hidden_states_proxy_tensors.tensors,
+                all_gather_group=self.attn_tp_group,
+            )
+
+    def _recv_and_process_next_microbatch(self,
+                                          pp_group,
+                                          next_mb,
+                                          ENABLE_RELEASE):
+        if next_mb is None:
+            return None
+
+        next_pp_outputs = PPProxyTensors(
+            pp_group.recv_tensor_dict(
+                all_gather_group=self.attn_tp_group
+            )
+        )
+
+        next_mb.output_ids = next_pp_outputs["next_token_ids"]
+        output_result = GenerationBatchResult(
+            logits_output=None,
+            pp_hidden_states_proxy_tensors=None,
+            next_token_ids=next_pp_outputs["next_token_ids"],
+            extend_input_len_per_req=None,
+            extend_logprob_start_len_per_req=None,
+            can_run_cuda_graph=self.running_batch.result.can_run_cuda_graph,
+        )
+
+        self.process_batch_result_disagg_prefill(next_mb, output_result)
+        next_release_rids = self.recv_pyobj_from_prev_stage() if ENABLE_RELEASE else None
+        if next_release_rids:
+            self.process_disagg_prefill_inflight_queue(next_release_rids)
+
+        return next_pp_outputs
+
+
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
         """
@@ -183,14 +295,15 @@ class SchedulerPPMixin:
 
         # Either success or failed
         bootstrapped_rids: List[str] = []
-        transferred_rids: List[str] = []
-        release_rids: Optional[List[str]] = None
 
         # transferred microbatch
         tmbs = [None] * self.pp_size
 
         ENABLE_RELEASE = True  # For debug
 
+        # Local reference variable for performance improvement
+        waiting_q = self.waiting_queue
+        pp_group = self.pp_group
         while True:
             server_is_idle = True
 
@@ -202,41 +315,11 @@ class SchedulerPPMixin:
 
                 self.process_input_requests(recv_reqs)
 
-                if self.pp_group.is_first_rank:
-                    # First rank, pop the bootstrap reqs from the bootstrap queue
-                    bootstrapped_reqs, failed_reqs = (
-                        self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
-                            return_failed_reqs=True
-                        )
-                    )
-                    bootstrapped_rids = [req.rid for req in bootstrapped_reqs] + [
-                        req.rid for req in failed_reqs
-                    ]
-                    self.waiting_queue.extend(bootstrapped_reqs)
-                else:
-                    # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
-                    bootstrapped_rids = self.recv_pyobj_from_prev_stage()
-                    bootstrapped_reqs = (
-                        self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
-                            rids_to_check=bootstrapped_rids
-                        )
-                    )
-                    self.waiting_queue.extend(bootstrapped_reqs)
+                boot_reqs, bootstrapped_rids = self._handle_bootstrap(pp_group)
+                if boot_reqs:
+                    waiting_q.extend(boot_reqs)
 
-                if self.pp_group.is_first_rank:
-                    transferred_rids = self.get_transferred_rids()
-                # if other ranks,
-                else:
-                    # 1. recv previous stage's transferred reqs info
-                    prev_transferred_rids = self.recv_pyobj_from_prev_stage()
-                    # 2. get the current stage's transferred reqs info
-                    curr_transferred_rids = self.get_transferred_rids()
-                    # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-                    transferred_rids = list(
-                        set(prev_transferred_rids) & set(curr_transferred_rids)
-                    )
-
-                tmbs[mb_id] = transferred_rids
+                tmbs[mb_id] = self._handle_transferred_rids(pp_group)
 
                 self.process_prefill_chunk()
 
@@ -248,99 +331,40 @@ class SchedulerPPMixin:
                 self.running_mbs[mb_id] = self.running_batch
 
                 self.cur_batch = mbs[mb_id]
-                if self.cur_batch:
-                    server_is_idle = False
-                    result = self.run_batch(self.cur_batch)
-
-                # send the outputs to the next step
-                if self.pp_group.is_last_rank:
+                # for last rank ouptuts, sending them to the next step
+                if pp_group.is_last_rank:
                     if self.cur_batch:
-                        next_token_ids = result.next_token_ids
-                        pp_outputs = PPProxyTensors(
-                            {
-                                "next_token_ids": next_token_ids,
-                            }
-                        )
-                        # send the output from the last round to let the next stage worker run post processing
-                        self.pp_group.send_tensor_dict(
-                            pp_outputs.tensors,
-                            all_gather_group=self.attn_tp_group,
-                        )
+                        server_is_idle = False
+                        result = self.run_batch(self.cur_batch)
+                        pp_outputs = self._send_last_rank_outputs(pp_group, tmbs[mb_id], result)
 
-                if ENABLE_RELEASE:
-                    if self.pp_group.is_last_rank:
-                        # At the last stage, all stages has reached the consensus to release memory for transferred_rids
-                        release_rids = transferred_rids
-                        # send to the first rank
-                        self.send_pyobj_to_next_stage(release_rids)
+                # for non-last ranks, forwarding them to the next stage
+                else:
+                   self._send_non_last_rank_outputs(
+                        pp_group,
+                        pp_outputs,
+                        recv_reqs,
+                        bootstrapped_rids,
+                        tmbs[mb_id]
+                    )
 
-                # receive outputs and post-process (filter finished reqs) the coming microbatch
+                # receive the comming microbatch outputs and post-process (filter finished reqs)
                 next_mb_id = (mb_id + 1) % self.pp_size
-                next_pp_outputs = None
-                next_release_rids = None
-
-                if mbs[next_mb_id] is not None:
-                    next_pp_outputs: Optional[PPProxyTensors] = PPProxyTensors(
-                        self.pp_group.recv_tensor_dict(
-                            all_gather_group=self.attn_tp_group
-                        )
+                last_mbs[next_mb_id] = mbs[next_mb_id]
+                next_pp_outputs = (
+                        self._recv_and_process_next_microbatch(
+                        pp_group,
+                        mbs[next_mb_id],
+                        ENABLE_RELEASE
                     )
-                    mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
-                    output_result = GenerationBatchResult(
-                        logits_output=None,
-                        pp_hidden_states_proxy_tensors=None,
-                        next_token_ids=next_pp_outputs["next_token_ids"],
-                        extend_input_len_per_req=None,
-                        extend_logprob_start_len_per_req=None,
-                        can_run_cuda_graph=result.can_run_cuda_graph,
-                    )
-                    self.process_batch_result_disagg_prefill(
-                        mbs[next_mb_id], output_result
-                    )
-
-                    last_mbs[next_mb_id] = mbs[next_mb_id]
-
-                if ENABLE_RELEASE:
-                    if tmbs[next_mb_id] is not None:
-                        # recv consensus rids from the previous rank
-                        next_release_rids = self.recv_pyobj_from_prev_stage()
-                        self.process_disagg_prefill_inflight_queue(next_release_rids)
-
-                # carry the outputs to the next stage
-                if not self.pp_group.is_last_rank:
-                    if pp_outputs:
-                        # send the outputs from the last round to let the next stage worker run post processing
-                        self.pp_group.send_tensor_dict(
-                            pp_outputs.tensors,
-                            all_gather_group=self.attn_tp_group,
-                        )
-                    if ENABLE_RELEASE:
-                        if release_rids is not None:
-                            self.send_pyobj_to_next_stage(release_rids)
-
-                if not self.pp_group.is_last_rank:
-                    # send out reqs to the next stage
-                    self.send_pyobj_to_next_stage(recv_reqs)
-                    self.send_pyobj_to_next_stage(bootstrapped_rids)
-                    self.send_pyobj_to_next_stage(transferred_rids)
-
-                    # send out proxy tensors to the next stage
-                    if self.cur_batch:
-                        # FIXME(lsyin): remove this assert
-                        assert result.pp_hidden_states_proxy_tensors.tensors is not None
-                        self.pp_group.send_tensor_dict(
-                            result.pp_hidden_states_proxy_tensors.tensors,
-                            all_gather_group=self.attn_tp_group,
-                        )
-
+                )
+                # update carry-over
                 pp_outputs = next_pp_outputs
-                release_rids = next_release_rids
 
                 self.running_batch.batch_is_full = False
 
-            if not ENABLE_RELEASE:
-                if len(self.disagg_prefill_inflight_queue) > 0:
-                    self.process_disagg_prefill_inflight_queue()
+            if not ENABLE_RELEASE and len(self.disagg_prefill_inflight_queue) > 0:
+                self.process_disagg_prefill_inflight_queue()
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
