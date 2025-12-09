@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional
 
-from torch.distributed import all_gather
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -15,7 +14,6 @@ if TYPE_CHECKING:
 
 
 class SchedulerPPMixin:
-
     @DynamicGradMode()
     def event_loop_pp(self):
         """A non-overlap scheduler loop for pipeline parallelism."""
@@ -136,7 +134,6 @@ class SchedulerPPMixin:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
-
     def _handle_bootstrap(self, pp_group):
         if pp_group.is_first_rank:
             boot_reqs, failed_reqs = (
@@ -151,13 +148,10 @@ class SchedulerPPMixin:
             return boot_reqs, boot_rids
 
         boot_rids = self.recv_pyobj_from_prev_stage()
-        boot_reqs = (
-            self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
-                rids_to_check=boot_rids
-            )
+        boot_reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
+            rids_to_check=boot_rids
         )
         return boot_reqs, boot_rids
-
 
     def _handle_transferred_rids(self, pp_group):
         curr = self.get_transferred_rids()
@@ -167,19 +161,13 @@ class SchedulerPPMixin:
         prev = self.recv_pyobj_from_prev_stage()
         return list(set(prev) & set(curr))
 
-
     def _send_last_rank_outputs(self, pp_group, release_rids, result):
         if not self.cur_batch:
             return None
 
-        pp_outputs = PPProxyTensors(
-            {
-                "next_token_ids": result.next_token_ids
-            }
-        )
+        pp_outputs = PPProxyTensors({"next_token_ids": result.next_token_ids})
         pp_group.send_tensor_dict(
-            pp_outputs.tensors,
-            all_gather_group=self.attn_tp_group
+            pp_outputs.tensors, all_gather_group=self.attn_tp_group
         )
 
         if release_rids:
@@ -187,19 +175,12 @@ class SchedulerPPMixin:
 
         return pp_outputs
 
-
-    def _send_non_last_rank_outputs(self,
-                                    pp_group,
-                                    pp_outputs,
-                                    recv_reqs,
-                                    boot_rids,
-                                    tmb,
-                                    release_rids=None
-                                    ):
+    def _send_non_last_rank_outputs(
+        self, pp_group, pp_outputs, recv_reqs, boot_rids, tmb, release_rids=None
+    ):
         if pp_outputs:
             pp_group.send_tensor_dict(
-                pp_outputs.tensors,
-                all_gather_group=self.attn_tp_group
+                pp_outputs.tensors, all_gather_group=self.attn_tp_group
             )
         if release_rids:
             self.send_pyobj_to_next_stage(release_rids)
@@ -209,23 +190,21 @@ class SchedulerPPMixin:
         self.send_pyobj_to_next_stage(tmb)
 
         if self.cur_batch:
-            assert self.running_batch.result.pp_hidden_states_proxy_tensors.tensors is not None
+            assert (
+                self.running_batch.result.pp_hidden_states_proxy_tensors.tensors
+                is not None
+            )
             pp_group.send_tensor_dict(
                 self.running_batch.result.pp_hidden_states_proxy_tensors.tensors,
                 all_gather_group=self.attn_tp_group,
             )
 
-    def _recv_and_process_next_microbatch(self,
-                                          pp_group,
-                                          next_mb,
-                                          ENABLE_RELEASE):
+    def _recv_and_process_next_microbatch(self, pp_group, next_mb, ENABLE_RELEASE):
         if next_mb is None:
             return None
 
         next_pp_outputs = PPProxyTensors(
-            pp_group.recv_tensor_dict(
-                all_gather_group=self.attn_tp_group
-            )
+            pp_group.recv_tensor_dict(all_gather_group=self.attn_tp_group)
         )
 
         next_mb.output_ids = next_pp_outputs["next_token_ids"]
@@ -239,12 +218,13 @@ class SchedulerPPMixin:
         )
 
         self.process_batch_result_disagg_prefill(next_mb, output_result)
-        next_release_rids = self.recv_pyobj_from_prev_stage() if ENABLE_RELEASE else None
+        next_release_rids = (
+            self.recv_pyobj_from_prev_stage() if ENABLE_RELEASE else None
+        )
         if next_release_rids:
             self.process_disagg_prefill_inflight_queue(next_release_rids)
 
         return next_pp_outputs
-
 
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
@@ -336,27 +316,21 @@ class SchedulerPPMixin:
                     if self.cur_batch:
                         server_is_idle = False
                         result = self.run_batch(self.cur_batch)
-                        pp_outputs = self._send_last_rank_outputs(pp_group, tmbs[mb_id], result)
+                        pp_outputs = self._send_last_rank_outputs(
+                            pp_group, tmbs[mb_id], result
+                        )
 
                 # for non-last ranks, forwarding them to the next stage
                 else:
-                   self._send_non_last_rank_outputs(
-                        pp_group,
-                        pp_outputs,
-                        recv_reqs,
-                        bootstrapped_rids,
-                        tmbs[mb_id]
+                    self._send_non_last_rank_outputs(
+                        pp_group, pp_outputs, recv_reqs, bootstrapped_rids, tmbs[mb_id]
                     )
 
                 # receive the comming microbatch outputs and post-process (filter finished reqs)
                 next_mb_id = (mb_id + 1) % self.pp_size
                 last_mbs[next_mb_id] = mbs[next_mb_id]
-                next_pp_outputs = (
-                        self._recv_and_process_next_microbatch(
-                        pp_group,
-                        mbs[next_mb_id],
-                        ENABLE_RELEASE
-                    )
+                next_pp_outputs = self._recv_and_process_next_microbatch(
+                    pp_group, mbs[next_mb_id], ENABLE_RELEASE
                 )
                 # update carry-over
                 pp_outputs = next_pp_outputs
